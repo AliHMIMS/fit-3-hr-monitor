@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Heart Rate</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--
+  OBS browser-source overlay. Served by hr_server.py at http://127.0.0.1:8765/
+  Query options (all optional):
+    window=120     seconds of history shown in the graph
+    color=ff4d5e   accent colour (heart + line), hex without '#'
+    graph=0        hide the graph (number only)
+    card=0         no background card (fully transparent)
+    ws=ws://host:port/ws   WebSocket URL if the page is opened from somewhere else
+-->
+<style>
+  :root {
+    --accent: #ff4d5e;
+    --ink: #ffffff;
+    --ink-muted: rgba(255, 255, 255, 0.55);
+    --card: rgba(12, 12, 16, 0.55);
+    --grid: rgba(255, 255, 255, 0.12);
+  }
+  html, body {
+    margin: 0;
+    background: transparent;
+    overflow: hidden;
+    font-family: "Segoe UI", system-ui, sans-serif;
+    color: var(--ink);
+  }
+  .card {
+    display: inline-flex;
+    align-items: center;
+    gap: 20px;
+    padding: 14px 20px;
+    border-radius: 18px;
+    background: var(--card);
+    text-shadow: 0 1px 3px rgba(0, 0, 0, 0.5);
+  }
+  .card.bare { background: transparent; padding: 0; }
+  .reading { display: flex; align-items: center; gap: 12px; min-width: 150px; }
+  .heart { width: 40px; height: 40px; fill: var(--accent); transform-origin: center; }
+  .beating .heart { animation: beat var(--beat, 1s) infinite ease-out; }
+  @keyframes beat {
+    0% { transform: scale(1); }
+    12% { transform: scale(1.22); }
+    24% { transform: scale(1); }
+    36% { transform: scale(1.1); }
+    55%, 100% { transform: scale(1); }
+  }
+  .value { font-size: 56px; font-weight: 700; line-height: 1; font-variant-numeric: tabular-nums; }
+  .unit { font-size: 16px; font-weight: 600; letter-spacing: 0.08em; color: var(--ink-muted); margin-top: 4px; }
+  .stale .value { color: var(--ink-muted); }
+  .stale .heart { opacity: 0.4; }
+  canvas { display: block; width: 320px; height: 80px; }
+  .hidden { display: none; }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div class="reading stale" id="reading">
+    <svg class="heart" viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+    </svg>
+    <div>
+      <div class="value" id="value">--</div>
+      <div class="unit">BPM</div>
+    </div>
+  </div>
+  <canvas id="graph" aria-label="Heart rate over time"></canvas>
+</div>
+
+<script>
+const params = new URLSearchParams(location.search);
+const WINDOW_MS = (Number(params.get("window")) || 120) * 1000;
+const STALE_MS = 8000;
+const wsUrl = params.get("ws") ||
+  (location.protocol.startsWith("http") ? `ws://${location.host}/ws` : "ws://127.0.0.1:8765/ws");
+
+if (params.get("color")) document.documentElement.style.setProperty("--accent", "#" + params.get("color"));
+if (params.get("card") === "0") document.getElementById("card").classList.add("bare");
+const canvas = document.getElementById("graph");
+if (params.get("graph") === "0") canvas.classList.add("hidden");
+
+const readingEl = document.getElementById("reading");
+const valueEl = document.getElementById("value");
+let points = [];          // [unix ms, bpm]
+let lastAt = 0;
+
+function addPoint(t, bpm) {
+  points.push([t, bpm]);
+  const cutoff = Date.now() - WINDOW_MS - 5000;
+  while (points.length && points[0][0] < cutoff) points.shift();
+}
+
+function showValue(bpm) {
+  valueEl.textContent = bpm;
+  readingEl.style.setProperty("--beat", (60 / Math.max(bpm, 30)).toFixed(3) + "s");
+}
+
+// The server stamps readings with its own clock; this page runs on the same machine.
+function connect() {
+  const ws = new WebSocket(wsUrl);
+  ws.onmessage = (ev) => {
+    const msg = JSON.parse(ev.data);
+    if (msg.type === "hello") {
+      points = [];
+      for (const [t, bpm] of msg.history) addPoint(t, bpm);
+      const last = msg.history[msg.history.length - 1];
+      if (last) { lastAt = last[0]; showValue(last[1]); }
+    } else if (msg.type === "hr") {
+      addPoint(msg.t, msg.bpm);
+      lastAt = msg.t;
+      showValue(msg.bpm);
+    }
+  };
+  ws.onclose = () => setTimeout(connect, 2000);
+}
+connect();
+
+function draw() {
+  const now = Date.now();
+  const stale = now - lastAt > STALE_MS;
+  readingEl.classList.toggle("stale", stale);
+  readingEl.classList.toggle("beating", !stale);
+  if (stale) valueEl.textContent = "--";
+
+  const dpr = window.devicePixelRatio || 1;
+  const w = canvas.clientWidth, h = canvas.clientHeight;
+  if (canvas.width !== w * dpr || canvas.height !== h * dpr) {
+    canvas.width = w * dpr; canvas.height = h * dpr;
+  }
+  const ctx = canvas.getContext("2d");
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, w, h);
+
+  const visible = points.filter(([t]) => t >= now - WINDOW_MS - 2000);
+  if (visible.length >= 2 && !canvas.classList.contains("hidden")) {
+    const css = getComputedStyle(document.documentElement);
+    const accent = css.getPropertyValue("--accent").trim();
+    const labelW = 30, padY = 8;
+    const plotW = w - labelW;
+
+    // Y range snaps to multiples of 10 with at least 20 bpm of spread.
+    let lo = Math.min(...visible.map(p => p[1]));
+    let hi = Math.max(...visible.map(p => p[1]));
+    lo = Math.floor((lo - 3) / 10) * 10;
+    hi = Math.ceil((hi + 3) / 10) * 10;
+    if (hi - lo < 20) { const mid = (hi + lo) / 2; lo = Math.floor((mid - 10) / 10) * 10; hi = lo + 20; }
+
+    const x = (t) => plotW * (1 - (now - t) / WINDOW_MS);
+    const y = (v) => padY + (h - 2 * padY) * (1 - (v - lo) / (hi - lo));
+
+    // Recessive grid: top and bottom bounds, labelled on the right.
+    ctx.strokeStyle = css.getPropertyValue("--grid").trim();
+    ctx.lineWidth = 1;
+    ctx.fillStyle = css.getPropertyValue("--ink-muted").trim();
+    ctx.font = "600 11px 'Segoe UI', system-ui, sans-serif";
+    ctx.textBaseline = "middle";
+    for (const v of [lo, hi]) {
+      ctx.beginPath();
+      ctx.moveTo(0, Math.round(y(v)) + 0.5);
+      ctx.lineTo(plotW, Math.round(y(v)) + 0.5);
+      ctx.stroke();
+      ctx.fillText(v, plotW + 6, y(v));
+    }
+
+    ctx.save();
+    ctx.beginPath();
+    ctx.rect(0, 0, plotW + 5, h);  // room for the latest-reading marker
+    ctx.clip();
+
+    const path = new Path2D();
+    visible.forEach(([t, v], i) => i ? path.lineTo(x(t), y(v)) : path.moveTo(x(t), y(v)));
+
+    // Soft fill under the line.
+    const fill = new Path2D(path);
+    fill.lineTo(x(visible[visible.length - 1][0]), h);
+    fill.lineTo(x(visible[0][0]), h);
+    fill.closePath();
+    const grad = ctx.createLinearGradient(0, 0, 0, h);
+    grad.addColorStop(0, accent + "55");
+    grad.addColorStop(1, accent + "00");
+    ctx.fillStyle = grad;
+    ctx.fill(fill);
+
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 2;
+    ctx.lineJoin = "round";
+    ctx.lineCap = "round";
+    ctx.stroke(path);
+
+    // Marker on the latest reading.
+    const [lt, lv] = visible[visible.length - 1];
+    if (!stale) {
+      ctx.beginPath();
+      ctx.arc(x(lt), y(lv), 4, 0, Math.PI * 2);
+      ctx.fillStyle = accent;
+      ctx.fill();
+    }
+    ctx.restore();
+  }
+  requestAnimationFrame(draw);
+}
+requestAnimationFrame(draw);
+</script>
+</body>
+</html>
